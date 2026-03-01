@@ -6,6 +6,7 @@ import org.jspecify.annotations.NonNull;
 import java.io.File;
 import java.io.Serializable;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -46,4 +47,10 @@ public interface AndroidModuleInfo extends Serializable {
      * {@code false} if it is a library module ({@code com.android.library}).
      */
     boolean isApplication();
+
+    /** All build variant names, e.g. ["debug", "release", "freeDebug", "paidRelease"]. */
+    @NonNull List<String> getVariantNames();
+
+    /** Per-variant data: source directories, compile classpath, build type, flavors. */
+    @NonNull Map<String, AndroidVariantInfo> getVariants();
 }
