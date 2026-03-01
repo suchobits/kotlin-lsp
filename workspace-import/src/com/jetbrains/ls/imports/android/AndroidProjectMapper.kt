@@ -25,7 +25,7 @@ private val LOG = logger<AndroidProjectMapper>()
  * For each Android module this adds:
  * - A [LibraryData] for the boot classpath (android.jar and optional platform libs)
  * - [LibraryData] entries for all resolved dependency JARs (AARs already extracted by Gradle)
- * - [SourceRootData] entries for the module's main source directories
+ * - [SourceRootData] entries for the active variant's merged source sets
  * - Corresponding [DependencyData.Library] references on the [ModuleData]
  */
 internal class AndroidProjectMapper {
@@ -33,6 +33,7 @@ internal class AndroidProjectMapper {
     fun merge(base: WorkspaceData, metadata: ProjectMetadata, projectDirectory: Path): WorkspaceData {
         if (metadata.androidModules.isEmpty()) return base
 
+        val config = AndroidLspConfig.load(projectDirectory)
         val extraLibraries = mutableListOf<LibraryData>()
         val moduleReplacements = mutableMapOf<String, ModuleData>()
 
@@ -40,6 +41,15 @@ internal class AndroidProjectMapper {
             LOG.info("Processing Android module: $moduleName (compileSdk=${androidInfo.compileSdkVersion})")
 
             val moduleDependencies = mutableListOf<DependencyData>()
+
+            // Determine active variant
+            val activeVariant = if (androidInfo.variantNames.isNotEmpty()) {
+                AndroidLspConfig.resolveValidVariant(config, moduleName, androidInfo.variantNames)
+            } else {
+                "debug" // Phase 1 fallback — no variant data available
+            }
+            val variantInfo = androidInfo.variants[activeVariant]
+            LOG.info("  Active variant: $activeVariant")
 
             // 1. Boot classpath library (android.jar + optional extras)
             val bootJars = androidInfo.bootClasspath.filter { it.exists() }
@@ -58,11 +68,11 @@ internal class AndroidProjectMapper {
                 LOG.warn("  No boot classpath JARs found for $moduleName")
             }
 
-            // 2. Dependency JARs from compile classpath
-            //    Gradle's transform pipeline has already extracted classes.jar from AARs.
-            //    Filter out boot classpath entries to avoid duplicates.
+            // 2. Variant-specific compile classpath (falls back to Phase 1 debug classpath)
+            val classpath = variantInfo?.compileClasspath
+                ?: androidInfo.debugCompileClasspath
             val bootPaths = androidInfo.bootClasspath.map { it.path }.toSet()
-            val depJars = androidInfo.debugCompileClasspath
+            val depJars = classpath
                 .filter { it.exists() && it.extension == "jar" && it.path !in bootPaths }
 
             depJars.forEachIndexed { index, jar ->
@@ -82,19 +92,27 @@ internal class AndroidProjectMapper {
             moduleDependencies.add(DependencyData.InheritedSdk)
             moduleDependencies.add(DependencyData.ModuleSource)
 
-            // 4. Source roots from main source set
-            val sourceDirs = androidInfo.mainSourceDirs.filter { it.exists() && it.isDirectory }
-            val sourceRoots = sourceDirs.map { dir ->
-                SourceRootData(dir.path, sourceRootType(dir))
+            // 4. Source roots — use variant-aware merge order if variant data available
+            val sourceRoots = if (variantInfo != null) {
+                val buildType = variantInfo.buildType
+                val flavors = variantInfo.productFlavors
+                val mergeOrder = SourceSetMergeOrder.computeMergeOrder(activeVariant, buildType, flavors)
+                val moduleDir = resolveModuleDir(projectDirectory, moduleName)
+                LOG.info("  Source set merge order: $mergeOrder")
+                SourceSetMergeOrder.resolveSourceDirs(moduleDir, mergeOrder)
+            } else {
+                // Phase 1 fallback — use mainSourceDirs
+                val sourceDirs = androidInfo.mainSourceDirs.filter { it.exists() && it.isDirectory }
+                sourceDirs.map { dir -> SourceRootData(dir.path, sourceRootType(dir)) }
             }
 
             if (sourceRoots.isEmpty()) {
                 LOG.warn("  No source directories found for $moduleName")
             } else {
-                LOG.info("  Source dirs: ${sourceDirs.map { it.name }}")
+                LOG.info("  Source roots: ${sourceRoots.size}")
             }
 
-            val contentRootPath = sourceDirs
+            val contentRootPath = sourceRoots
                 .map { it.path }
                 .findCommonPrefix()
                 .ifEmpty { "$projectDirectory${File.separator}src${File.separator}main" }
@@ -125,6 +143,14 @@ internal class AndroidProjectMapper {
             modules = mergedModules + newModules,
             libraries = base.libraries + extraLibraries
         )
+    }
+
+    private fun resolveModuleDir(projectDir: Path, moduleName: String): Path {
+        // Module names may use ":" separators (e.g. ":app", ":feature:login")
+        val relativePath = moduleName.removePrefix(":").replace(':', File.separatorChar)
+        val moduleDir = projectDir.resolve(relativePath)
+        // If resolved dir doesn't exist, try the project root (single-module project)
+        return if (moduleDir.toFile().exists()) moduleDir else projectDir
     }
 
     private fun sourceRootType(dir: File): String {
