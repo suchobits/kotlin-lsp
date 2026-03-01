@@ -2,7 +2,9 @@
 package com.jetbrains.ls.imports.gradle.android.model.builder;
 
 import com.jetbrains.ls.imports.gradle.android.model.AndroidModuleInfo;
+import com.jetbrains.ls.imports.gradle.android.model.AndroidVariantInfo;
 import com.jetbrains.ls.imports.gradle.android.model.impl.AndroidModuleInfoImpl;
+import com.jetbrains.ls.imports.gradle.android.model.impl.AndroidVariantInfoImpl;
 import org.gradle.api.Project;
 import org.gradle.api.Task;
 import org.gradle.api.file.FileCollection;
@@ -15,7 +17,9 @@ import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -41,18 +45,48 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
         }
 
         try {
+            // Phase 1 fields (unchanged)
             List<File> bootClasspath = getBootClasspath(androidExt);
             String compileSdkVersion = getCompileSdkVersion(androidExt);
             boolean isApp = androidExt.getClass().getName().contains("AppExtension");
-            Set<File> compileClasspath = getDebugCompileClasspath(project);
             Set<File> mainSourceDirs = getMainSourceDirs(androidExt);
+            Set<File> debugCompileClasspath = getVariantCompileClasspath(project, "debug");
+
+            // Phase 2: extract all variants
+            List<String> variantNames = new ArrayList<>();
+            Map<String, AndroidVariantInfo> variants = new LinkedHashMap<>();
+
+            Object variantList = getApplicationOrLibraryVariants(androidExt, isApp);
+            if (variantList instanceof Iterable) {
+                for (Object variant : (Iterable<?>) variantList) {
+                    try {
+                        String name = (String) invokeMethod(variant, "getName");
+                        String buildType = getBuildTypeName(variant);
+
+                        List<String> flavors = getProductFlavorNames(variant);
+
+                        Set<File> variantSourceDirs = getVariantSourceDirs(androidExt, name);
+                        Set<File> variantClasspath = getVariantCompileClasspath(project, name);
+                        boolean debuggable = getBooleanSafe(variant, "getDebuggable");
+
+                        variantNames.add(name);
+                        variants.put(name, new AndroidVariantInfoImpl(
+                                name, buildType, flavors, variantSourceDirs, variantClasspath, debuggable
+                        ));
+                    } catch (Exception e) {
+                        System.err.println("[kotlin-lsp] Failed to extract variant info: " + e.getMessage());
+                    }
+                }
+            }
 
             return new AndroidModuleInfoImpl(
                     bootClasspath,
-                    compileClasspath,
+                    debugCompileClasspath,
                     mainSourceDirs,
                     compileSdkVersion,
-                    isApp
+                    isApp,
+                    variantNames,
+                    variants
             );
         } catch (Exception e) {
             System.err.println("[kotlin-lsp] Failed to extract Android info for "
@@ -92,12 +126,30 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
         return "android-34"; // safe fallback
     }
 
-    private static @NonNull Set<File> getDebugCompileClasspath(@NonNull Project project) {
-        // Try compileDebugKotlin first (Kotlin projects), then compileDebugJavaWithJavac
-        for (String taskName : new String[]{"compileDebugKotlin", "compileDebugJavaWithJavac"}) {
-            Task task = project.getTasks().findByName(taskName);
+    /**
+     * Get applicationVariants (for app) or libraryVariants (for library).
+     */
+    private static @Nullable Object getApplicationOrLibraryVariants(
+            @NonNull Object androidExt, boolean isApp) {
+        try {
+            String method = isApp ? "getApplicationVariants" : "getLibraryVariants";
+            return invokeMethod(androidExt, method);
+        } catch (Exception e) {
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Get compile classpath for a specific variant by finding its compile task.
+     */
+    private static @NonNull Set<File> getVariantCompileClasspath(
+            @NonNull Project project, @NonNull String variantName) {
+        String capitalized = variantName.substring(0, 1).toUpperCase() + variantName.substring(1);
+        for (String prefix : List.of("compile" + capitalized + "Kotlin",
+                                      "compile" + capitalized + "JavaWithJavac")) {
+            Task task = project.getTasks().findByName(prefix);
             if (task != null) {
-                Set<File> files = getClasspathFromTask(task, taskName);
+                Set<File> files = getClasspathFromTask(task, prefix);
                 if (!files.isEmpty()) {
                     return files;
                 }
@@ -107,7 +159,6 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
     }
 
     private static @NonNull Set<File> getClasspathFromTask(@NonNull Task task, @NonNull String taskName) {
-        // Try "getClasspath" (KotlinCompile), then "getOptions().getBootstrapClasspath()"
         for (String methodName : new String[]{"getClasspath", "getLibraries"}) {
             try {
                 Object result = invokeMethod(task, methodName);
@@ -123,14 +174,12 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
     @SuppressWarnings("unchecked")
     private static @NonNull Set<File> getMainSourceDirs(@NonNull Object androidExt) {
         try {
-            // androidExt.sourceSets.getByName("main").java.srcDirs
             Object sourceSets = invokeMethod(androidExt, "getSourceSets");
             Object mainSet = invokeNamedMethod(sourceSets, "getByName", "main");
             if (mainSet == null) return Collections.emptySet();
 
             Set<File> allDirs = new HashSet<>();
 
-            // java source dirs
             Object javaSet = invokeMethod(mainSet, "getJava");
             if (javaSet != null) {
                 Object srcDirs = invokeMethod(javaSet, "getSrcDirs");
@@ -139,7 +188,6 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
                 }
             }
 
-            // kotlin source dirs (AGP adds "kotlin" extension to AndroidSourceSet in recent versions)
             try {
                 Object kotlinSet = invokeMethod(mainSet, "getKotlin");
                 if (kotlinSet != null) {
@@ -149,7 +197,6 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
                     }
                 }
             } catch (Exception ignored) {
-                // kotlin extension may not exist on older AGP, that's fine
             }
 
             return allDirs;
@@ -157,6 +204,81 @@ public final class AndroidModuleInfoModelBuilder implements ToolingModelBuilder 
             System.err.println("[kotlin-lsp] Could not get mainSourceDirs: " + e.getMessage());
             return Collections.emptySet();
         }
+    }
+
+    /**
+     * Get source directories for a specific variant's source set.
+     * Returns dirs from the variant-specific source set only (not merged).
+     */
+    @SuppressWarnings("unchecked")
+    private static @NonNull Set<File> getVariantSourceDirs(
+            @NonNull Object androidExt, @NonNull String variantName) {
+        try {
+            Object sourceSets = invokeMethod(androidExt, "getSourceSets");
+            Object variantSet = invokeNamedMethod(sourceSets, "findByName", variantName);
+            if (variantSet == null) return Collections.emptySet();
+
+            Set<File> dirs = new HashSet<>();
+
+            Object javaSet = invokeMethod(variantSet, "getJava");
+            if (javaSet != null) {
+                Object srcDirs = invokeMethod(javaSet, "getSrcDirs");
+                if (srcDirs instanceof Set) {
+                    dirs.addAll((Set<File>) srcDirs);
+                }
+            }
+
+            try {
+                Object kotlinSet = invokeMethod(variantSet, "getKotlin");
+                if (kotlinSet != null) {
+                    Object srcDirs = invokeMethod(kotlinSet, "getSrcDirs");
+                    if (srcDirs instanceof Set) {
+                        dirs.addAll((Set<File>) srcDirs);
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+
+            return dirs;
+        } catch (Exception e) {
+            return Collections.emptySet();
+        }
+    }
+
+    private static @NonNull String getBuildTypeName(@NonNull Object variant) {
+        try {
+            Object buildType = invokeMethod(variant, "getBuildType");
+            if (buildType instanceof String) {
+                return (String) buildType;
+            }
+            return (String) invokeMethod(buildType, "getName");
+        } catch (Exception e) {
+            return "debug";
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static @NonNull List<String> getProductFlavorNames(@NonNull Object variant) {
+        List<String> flavors = new ArrayList<>();
+        try {
+            Iterable<?> flavorList = (Iterable<?>) invokeMethod(variant, "getProductFlavors");
+            for (Object flavor : flavorList) {
+                flavors.add((String) invokeMethod(flavor, "getName"));
+            }
+        } catch (Exception ignored) {
+        }
+        return flavors;
+    }
+
+    private static boolean getBooleanSafe(@NonNull Object obj, @NonNull String methodName) {
+        try {
+            Object result = invokeMethod(obj, methodName);
+            if (result instanceof Boolean) {
+                return (Boolean) result;
+            }
+        } catch (Exception ignored) {
+        }
+        return false;
     }
 
     private static @NonNull Set<File> resolveFileCollection(
