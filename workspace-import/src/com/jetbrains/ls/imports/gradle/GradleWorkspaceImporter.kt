@@ -10,6 +10,7 @@ import com.intellij.platform.workspace.storage.MutableEntityStorage
 import com.intellij.platform.workspace.storage.impl.url.toVirtualFileUrl
 import com.intellij.platform.workspace.storage.url.VirtualFileUrlManager
 import com.intellij.util.io.delete
+import com.jetbrains.ls.imports.android.AndroidProjectMapper
 import com.jetbrains.ls.imports.api.WorkspaceEntitySource
 import com.jetbrains.ls.imports.api.WorkspaceImporter
 import com.jetbrains.ls.imports.gradle.GradleToolingApiHelper.findTheMostCompatibleJdk
@@ -69,9 +70,15 @@ object GradleWorkspaceImporter : WorkspaceImporter {
             }
         val entitySource = WorkspaceEntitySource(projectDirectory.toVirtualFileUrl(virtualFileUrlManager))
         return MutableEntityStorage.create().apply {
+            val baseWorkspaceData = IdeaProjectMapper().toWorkspaceData(gradleProjectData)
+            val workspaceData = if (gradleProjectData.androidModules.isNotEmpty()) {
+                AndroidProjectMapper().merge(baseWorkspaceData, gradleProjectData, projectDirectory)
+            } else {
+                baseWorkspaceData
+            }
             importWorkspaceData(
                 postProcessWorkspaceData(
-                    IdeaProjectMapper().toWorkspaceData(gradleProjectData),
+                    workspaceData,
                     projectDirectory,
                     onUnresolvedDependency
                 ),

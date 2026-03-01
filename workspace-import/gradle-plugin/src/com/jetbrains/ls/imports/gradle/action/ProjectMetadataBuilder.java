@@ -1,6 +1,7 @@
 // Copyright 2000-2026 JetBrains s.r.o. and contributors. Use of this source code is governed by the Apache 2.0 license.
 package com.jetbrains.ls.imports.gradle.action;
 
+import com.jetbrains.ls.imports.gradle.android.model.AndroidModuleInfo;
 import com.jetbrains.ls.imports.gradle.model.KotlinModule;
 import com.jetbrains.ls.imports.gradle.model.ModuleSourceSet;
 import com.jetbrains.ls.imports.gradle.model.ModuleSourceSets;
@@ -33,14 +34,16 @@ public class ProjectMetadataBuilder implements BuildAction<ProjectMetadata> {
     public @NonNull ProjectMetadata execute(@NonNull BuildController controller) {
         Map<String, KotlinModule> kotlinModules = new HashMap<>();
         Map<String, Set<ModuleSourceSet>> sourceSets = new HashMap<>();
+        Map<String, AndroidModuleInfo> androidModules = new HashMap<>();
         List<IdeaProject> ideaProjects = fetchProjects(controller);
         for (IdeaProject project : ideaProjects) {
-            fetchProjectData(project, controller, kotlinModules, sourceSets);
+            fetchProjectData(project, controller, kotlinModules, sourceSets, androidModules);
         }
         return new ProjectMetadata(
                 ideaProjects,
                 kotlinModules,
-                sourceSets
+                sourceSets,
+                androidModules
         );
     }
 
@@ -48,7 +51,8 @@ public class ProjectMetadataBuilder implements BuildAction<ProjectMetadata> {
             @NonNull IdeaProject project,
             @NonNull BuildController controller,
             @NonNull Map<@NonNull String, @NonNull KotlinModule> kotlinModules,
-            @NonNull Map<@NonNull String, @NonNull Set<ModuleSourceSet>> sourceSets
+            @NonNull Map<@NonNull String, @NonNull Set<ModuleSourceSet>> sourceSets,
+            @NonNull Map<@NonNull String, @NonNull AndroidModuleInfo> androidModules
     ) {
         for (IdeaModule module : project.getModules()) {
             String moduleFqdn = getModuleFqdn(module);
@@ -60,6 +64,11 @@ public class ProjectMetadataBuilder implements BuildAction<ProjectMetadata> {
 
             ModuleSourceSets moduleSourceSets = unwrapFetchedModel(controller.fetch(module, ModuleSourceSets.class));
             sourceSets.put(moduleFqdn, moduleSourceSets == null ? Collections.emptySet() : moduleSourceSets.getSourceSets());
+
+            AndroidModuleInfo androidInfo = unwrapFetchedModel(controller.fetch(module, AndroidModuleInfo.class));
+            if (androidInfo != null) {
+                androidModules.put(moduleFqdn, androidInfo);
+            }
         }
     }
 
