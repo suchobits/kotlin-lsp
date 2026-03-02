@@ -133,4 +133,45 @@ class AndroidLspConfigTest {
         )
         assertEquals("staging", result)
     }
+
+    @Test
+    fun `resolveVariantForModule with empty list falls back to debug`() {
+        val result = AndroidLspConfig.resolveVariantForModule(
+            "freeDebug", "debug", emptyList()
+        )
+        assertEquals("debug", result)
+    }
+
+    @Test
+    fun `resolveValidVariant with empty available list returns debug`() {
+        val config = AndroidLspConfig.Config(activeVariant = "release")
+        val result = AndroidLspConfig.resolveValidVariant(config, "app", emptyList())
+        assertEquals("debug", result)
+    }
+
+    @Test
+    fun `resolveVariant uses activeVariant when module has no override`() {
+        val config = AndroidLspConfig.Config(
+            activeVariant = "freeRelease",
+            moduleVariants = mapOf("other-module" to "paidDebug")
+        )
+        assertEquals("freeRelease", AndroidLspConfig.resolveVariant(config, "app"))
+    }
+
+    @Test
+    fun `parses config with only moduleVariants and no activeVariant`() {
+        tempDir.resolve("kotlin-lsp-config.json").writeText("""
+            {
+                "android": {
+                    "moduleVariants": {
+                        "app": "freeDebug"
+                    }
+                }
+            }
+        """.trimIndent())
+
+        val config = AndroidLspConfig.load(tempDir)
+        assertEquals("debug", config.activeVariant)
+        assertEquals("freeDebug", config.moduleVariants["app"])
+    }
 }

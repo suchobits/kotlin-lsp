@@ -83,4 +83,48 @@ class SourceSetMergeOrderTest {
         assertEquals("java-source", javaRoot!!.type)
         assertEquals("kotlin-source", kotlinRoot!!.type)
     }
+
+    @Test
+    fun `three flavor dimensions produces correct merge order`() {
+        val order = SourceSetMergeOrder.computeMergeOrder(
+            "freeProStagingDebug", "debug", listOf("free", "pro", "staging")
+        )
+        // Expected: variant → buildType → combinedFlavors → individual flavors (reverse) → main
+        assertEquals(
+            listOf("freeProStagingDebug", "debug", "freeProStaging", "staging", "pro", "free", "main"),
+            order
+        )
+    }
+
+    @Test
+    fun `resolveSourceDirs preserves merge order when all dirs exist`() {
+        val moduleDir = tempDir.resolve("app")
+        moduleDir.resolve("src/freeDebug/kotlin").createDirectories()
+        moduleDir.resolve("src/debug/java").createDirectories()
+        moduleDir.resolve("src/debug/kotlin").createDirectories()
+        moduleDir.resolve("src/free/java").createDirectories()
+        moduleDir.resolve("src/main/java").createDirectories()
+        moduleDir.resolve("src/main/kotlin").createDirectories()
+
+        val mergeOrder = listOf("freeDebug", "debug", "free", "main")
+        val roots = SourceSetMergeOrder.resolveSourceDirs(moduleDir, mergeOrder)
+
+        // Should be: freeDebug/kotlin, debug/java, debug/kotlin, free/java, main/java, main/kotlin
+        assertEquals(6, roots.size)
+        val paths = roots.map { it.path }
+        val freeDebugIdx = paths.indexOfFirst { it.contains("freeDebug") }
+        val debugIdx = paths.indexOfFirst { it.contains("/debug/") }
+        val freeIdx = paths.indexOfFirst { it.contains("/free/") }
+        val mainIdx = paths.indexOfFirst { it.contains("/main/") }
+        assertTrue(freeDebugIdx < debugIdx, "freeDebug dirs should come before debug dirs")
+        assertTrue(debugIdx < freeIdx, "debug dirs should come before free dirs")
+        assertTrue(freeIdx < mainIdx, "free dirs should come before main dirs")
+    }
+
+    @Test
+    fun `resolveSourceDirs returns empty list when no dirs exist`() {
+        val moduleDir = tempDir.resolve("app").also { it.createDirectories() }
+        val roots = SourceSetMergeOrder.resolveSourceDirs(moduleDir, listOf("debug", "main"))
+        assertTrue(roots.isEmpty())
+    }
 }

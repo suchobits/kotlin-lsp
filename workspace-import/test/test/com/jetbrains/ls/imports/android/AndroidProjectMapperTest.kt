@@ -405,6 +405,303 @@ class AndroidProjectMapperTest {
         assertTrue(hasDebugJar, "Should fall back to debug variant when configured variant not found")
     }
 
+    @Test
+    fun `multiple android modules with per-module variant overrides`() {
+        // Two Android modules: "app" uses freeDebug, "feature-login" uses paidRelease
+        val appDebugJar = tempDir.resolve("deps/app-free-debug.jar")
+            .also { it.parent.createDirectories() }
+            .also { it.toFile().createNewFile() }
+        val loginReleaseJar = tempDir.resolve("deps/login-paid-release.jar")
+            .also { it.parent.createDirectories() }
+            .also { it.toFile().createNewFile() }
+
+        // Set up source dirs for both modules
+        tempDir.resolve("app/src/freeDebug/kotlin").createDirectories()
+        tempDir.resolve("app/src/main/java").createDirectories()
+        tempDir.resolve("feature-login/src/paidRelease/kotlin").createDirectories()
+        tempDir.resolve("feature-login/src/main/java").createDirectories()
+
+        val appFreeDebug = FakeAndroidVariantInfo(
+            name = "freeDebug", buildType = "debug", productFlavors = listOf("free"),
+            sourceDirs = emptySet(), compileClasspath = setOf(appDebugJar.toFile()), debuggable = true
+        )
+        val appPaidRelease = FakeAndroidVariantInfo(
+            name = "paidRelease", buildType = "release", productFlavors = listOf("paid"),
+            sourceDirs = emptySet(), compileClasspath = emptySet(), debuggable = false
+        )
+        val appInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(), debugCompileClasspath = emptySet(),
+            mainSourceDirs = emptySet(), compileSdkVersion = "android-34", isApplication = true,
+            variantNames = listOf("freeDebug", "paidRelease"),
+            variants = mapOf("freeDebug" to appFreeDebug, "paidRelease" to appPaidRelease)
+        )
+
+        val loginPaidRelease = FakeAndroidVariantInfo(
+            name = "paidRelease", buildType = "release", productFlavors = listOf("paid"),
+            sourceDirs = emptySet(), compileClasspath = setOf(loginReleaseJar.toFile()), debuggable = false
+        )
+        val loginFreeDebug = FakeAndroidVariantInfo(
+            name = "freeDebug", buildType = "debug", productFlavors = listOf("free"),
+            sourceDirs = emptySet(), compileClasspath = emptySet(), debuggable = true
+        )
+        val loginInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(), debugCompileClasspath = emptySet(),
+            mainSourceDirs = emptySet(), compileSdkVersion = "android-34", isApplication = false,
+            variantNames = listOf("freeDebug", "paidRelease"),
+            variants = mapOf("freeDebug" to loginFreeDebug, "paidRelease" to loginPaidRelease)
+        )
+
+        // Config: app→freeDebug, feature-login→paidRelease
+        tempDir.resolve("kotlin-lsp-config.json").writeText("""
+            {
+                "android": {
+                    "activeVariant": "freeDebug",
+                    "moduleVariants": {
+                        "feature-login": "paidRelease"
+                    }
+                }
+            }
+        """.trimIndent())
+
+        val base = WorkspaceData(
+            modules = listOf(ModuleData(name = "app"), ModuleData(name = "feature-login")),
+            libraries = emptyList()
+        )
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(),
+            mapOf("app" to appInfo, "feature-login" to loginInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        // app should have the freeDebug JAR
+        val hasAppDebugJar = result.libraries.any { lib ->
+            lib.roots.any { it.path == appDebugJar.toString() }
+        }
+        assertTrue(hasAppDebugJar, "app should use freeDebug classpath")
+
+        // feature-login should have the paidRelease JAR
+        val hasLoginReleaseJar = result.libraries.any { lib ->
+            lib.roots.any { it.path == loginReleaseJar.toString() }
+        }
+        assertTrue(hasLoginReleaseJar, "feature-login should use paidRelease classpath")
+
+        // Both modules should be present in result
+        assertEquals(2, result.modules.size)
+        assertNotNull(result.modules.find { it.name == "app" })
+        assertNotNull(result.modules.find { it.name == "feature-login" })
+    }
+
+    @Test
+    fun `phase 1 fallback uses mainSourceDirs when no variant data`() {
+        val srcDir = tempDir.resolve("app/src/main/java")
+            .also { it.createDirectories() }
+
+        val androidInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(),
+            debugCompileClasspath = emptySet(),
+            mainSourceDirs = setOf(srcDir.toFile()),
+            compileSdkVersion = "android-34",
+            isApplication = true
+            // No variantNames or variants — Phase 1 behavior
+        )
+
+        val base = WorkspaceData(modules = listOf(ModuleData(name = "app")), libraries = emptyList())
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(), mapOf("app" to androidInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        val appModule = result.modules.find { it.name == "app" }!!
+        val sourceRoots = appModule.contentRoots.flatMap { it.sourceRoots }
+        assertTrue(sourceRoots.any { it.path == srcDir.toString() },
+            "Phase 1 fallback should use mainSourceDirs")
+    }
+
+    @Test
+    fun `resolves colon-separated module name to subdirectory`() {
+        // Module ":feature:login" should resolve to feature/login/ subdir
+        val srcDir = tempDir.resolve("feature/login/src/debug/kotlin")
+            .also { it.createDirectories() }
+        tempDir.resolve("feature/login/src/main/java").createDirectories()
+
+        val debugVariant = FakeAndroidVariantInfo(
+            name = "debug", buildType = "debug", productFlavors = emptyList(),
+            sourceDirs = emptySet(), compileClasspath = emptySet(), debuggable = true
+        )
+
+        val androidInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(),
+            debugCompileClasspath = emptySet(),
+            mainSourceDirs = emptySet(),
+            compileSdkVersion = "android-34",
+            isApplication = false,
+            variantNames = listOf("debug"),
+            variants = mapOf("debug" to debugVariant)
+        )
+
+        val base = WorkspaceData(
+            modules = listOf(ModuleData(name = ":feature:login")),
+            libraries = emptyList()
+        )
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(), mapOf(":feature:login" to androidInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        val featureModule = result.modules.find { it.name == ":feature:login" }!!
+        val sourceRoots = featureModule.contentRoots.flatMap { it.sourceRoots }
+        // Should find sources under feature/login/src/
+        assertTrue(sourceRoots.isNotEmpty(), "Should resolve source dirs under feature/login/")
+        assertTrue(sourceRoots.any { it.path.contains("feature") && it.path.contains("login") },
+            "Source roots should be under the colon-separated module path")
+    }
+
+    @Test
+    fun `android module not in base adds it to result`() {
+        val androidInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(),
+            debugCompileClasspath = emptySet(),
+            mainSourceDirs = emptySet(),
+            compileSdkVersion = "android-34",
+            isApplication = true
+        )
+
+        // Base has no modules, but metadata has an android module
+        val base = WorkspaceData(modules = emptyList(), libraries = emptyList())
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(), mapOf("new-app" to androidInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        assertNotNull(result.modules.find { it.name == "new-app" },
+            "Android module not in base should be added to result")
+    }
+
+    @Test
+    fun `multi-flavor variant with two flavors resolves source dirs in correct order`() {
+        // freeStagingDebug: flavors = [free, staging], buildType = debug
+        tempDir.resolve("app/src/freeStagingDebug/kotlin").createDirectories()
+        tempDir.resolve("app/src/debug/java").createDirectories()
+        tempDir.resolve("app/src/staging/kotlin").createDirectories()
+        tempDir.resolve("app/src/free/java").createDirectories()
+        tempDir.resolve("app/src/main/java").createDirectories()
+        tempDir.resolve("app/src/main/kotlin").createDirectories()
+
+        val variant = FakeAndroidVariantInfo(
+            name = "freeStagingDebug", buildType = "debug", productFlavors = listOf("free", "staging"),
+            sourceDirs = emptySet(), compileClasspath = emptySet(), debuggable = true
+        )
+
+        val androidInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(), debugCompileClasspath = emptySet(),
+            mainSourceDirs = emptySet(), compileSdkVersion = "android-34", isApplication = true,
+            variantNames = listOf("freeStagingDebug"),
+            variants = mapOf("freeStagingDebug" to variant)
+        )
+
+        tempDir.resolve("kotlin-lsp-config.json").writeText("""
+            {
+                "android": {
+                    "activeVariant": "freeStagingDebug"
+                }
+            }
+        """.trimIndent())
+
+        val base = WorkspaceData(modules = listOf(ModuleData(name = "app")), libraries = emptyList())
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(), mapOf("app" to androidInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        val appModule = result.modules.find { it.name == "app" }!!
+        val sourceRoots = appModule.contentRoots.flatMap { it.sourceRoots }
+        val paths = sourceRoots.map { it.path }
+
+        // Verify all expected dirs are present
+        assertTrue(paths.any { it.contains("freeStagingDebug") }, "freeStagingDebug source present")
+        assertTrue(paths.any { it.contains("/debug/") }, "debug source present")
+        assertTrue(paths.any { it.contains("/staging/") }, "staging source present")
+        assertTrue(paths.any { it.contains("/free/") }, "free source present")
+        assertTrue(paths.any { it.contains("/main/") }, "main source present")
+
+        // Verify merge order
+        val variantIdx = paths.indexOfFirst { it.contains("freeStagingDebug") }
+        val debugIdx = paths.indexOfFirst { it.contains("/debug/") }
+        val stagingIdx = paths.indexOfFirst { it.contains("/staging/") }
+        val freeIdx = paths.indexOfFirst { it.contains("/free/") }
+        val mainIdx = paths.indexOfFirst { it.contains("/main/") }
+
+        assertTrue(variantIdx < debugIdx, "freeStagingDebug before debug")
+        assertTrue(debugIdx < stagingIdx, "debug before staging")
+        assertTrue(stagingIdx < freeIdx, "staging before free")
+        assertTrue(freeIdx < mainIdx, "free before main")
+    }
+
+    @Test
+    fun `uses phase 1 debug classpath when variant has no classpath`() {
+        val debugJar = tempDir.resolve("deps/debug-fallback.jar")
+            .also { it.parent.createDirectories() }
+            .also { it.toFile().createNewFile() }
+
+        // Module has variant names but the variants map is empty (partial Phase 2)
+        val androidInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(),
+            debugCompileClasspath = setOf(debugJar.toFile()),
+            mainSourceDirs = emptySet(),
+            compileSdkVersion = "android-34",
+            isApplication = true,
+            variantNames = listOf("debug"),
+            variants = emptyMap() // Variant data missing
+        )
+
+        val base = WorkspaceData(modules = listOf(ModuleData(name = "app")), libraries = emptyList())
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(), mapOf("app" to androidInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        val hasDebugJar = result.libraries.any { lib ->
+            lib.roots.any { it.path == debugJar.toString() }
+        }
+        assertTrue(hasDebugJar, "Should fall back to Phase 1 debugCompileClasspath when variant data missing")
+    }
+
+    @Test
+    fun `preserves existing base libraries when merging`() {
+        val existingLib = LibraryData(
+            name = "existing-lib",
+            type = "COMPILE",
+            roots = listOf(LibraryRootData("/some/lib.jar", "CLASSES"))
+        )
+
+        val androidInfo = FakeAndroidModuleInfo(
+            bootClasspath = emptyList(),
+            debugCompileClasspath = emptySet(),
+            mainSourceDirs = emptySet(),
+            compileSdkVersion = "android-34",
+            isApplication = true
+        )
+
+        val base = WorkspaceData(
+            modules = listOf(ModuleData(name = "app")),
+            libraries = listOf(existingLib)
+        )
+        val metadata = ProjectMetadata(
+            emptyList(), emptyMap(), emptyMap(), mapOf("app" to androidInfo)
+        )
+
+        val result = mapper.merge(base, metadata, tempDir)
+
+        assertTrue(result.libraries.any { it.name == "existing-lib" },
+            "Existing libraries should be preserved")
+    }
+
     // Minimal fake implementations for testing
     private class FakeAndroidModuleInfo(
         private val bootClasspath: List<File>,
